@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+# Terminal slideshow using catimg with keyboard controls
+# Usage: minicatimgslideshow [directory] [delay_seconds]
+# Controls: n=next, p=previous, space=pause/unpause, u=upscale, h=hide, q=quit
+
+set -eo pipefail
+
+IMAGE_DIR="${1:-}"
+DELAY="${2:-10}"
+CURRENT_IDX=0
+PAUSED=false
+VERBOSE=true
+UPSCALE=false
+SUPERSCALE=false
+WIDTH_PERCENT=100
+TEMP_DIR="/tmp/slideshow-$$"
+CONVERSION_QUEUE="$TEMP_DIR/queue"
+
+if ! command -v catimg &> /dev/null; then
+    echo "Error: catimg not found. Install: yay -S catimg"
+    exit 1
+fi
+
+HAS_FFMPEG=false
+if command -v ffmpeg &> /dev/null; then
+    HAS_FFMPEG=true
+fi
+
+if [[ -z "$IMAGE_DIR" ]]; then
+    read -e -p "Directory path with images/videos: " DIR_INPUT
+    IMAGE_DIR="${DIR_INPUT/#\~/$HOME}"
+fi
+
+if [[ ! -d "$IMAGE_DIR" ]]; then
+    echo "Error: Directory not found: $IMAGE_DIR"
+    exit 1
+fi
+
+mkdir -p "$TEMP_DIR"
+touch "$CONVERSION_QUEUE"
+
+shopt -s nullglob
+IMAGES=("$IMAGE_DIR"/*.{jpg,jpeg,png,gif,JPG,JPEG,PNG,GIF})
+VIDEOS=("$IMAGE_DIR"/*.{mp4,mov,MP4,MOV})
+
+if [[ ${#IMAGES[@]} -eq 0 ]] && [[ ${#VIDEOS[@]} -eq 0 ]]; then
+    echo "Error: No media found in $IMAGE_DIR"
+    rm -rf "$TEMP_DIR"
+    exit 1
+fi
+
+if [[ ${#IMAGES[@]} -eq 0 ]] && [[ ${#VIDEOS[@]} -gt 0 ]]; then
+    echo "🎬 Converting first video..."
+    first_video="${VIDEOS[0]}"
+    output="$TEMP_DIR/$(basename "$first_video").gif"
+    if ffmpeg -i "$first_video" -vf "fps=30,scale=320:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse" -c:v gif -f gif "$output" -y &>/dev/null; then
+        IMAGES=("$output")
+        VIDEOS=("${VIDEOS[@]:1}")
+    else
+        echo "Error: Failed to convert video"
+        rm -rf "$TEMP_DIR"
+        exit 1
+    fi
+fi
+
+if [[ ${#IMAGES[@]} -gt 0 ]]; then
+    IMAGES=($(shuf -e "${IMAGES[@]}"))
+    TOTAL=${#IMAGES[@]}
+else
+    TOTAL=0
+fi
+
+convert_videos_background() {
+    for video in "${VIDEOS[@]}"; do
+        output="$TEMP_DIR/$(basename "$video").gif"
+        if ffmpeg -i "$video" -vf "fps=30,scale=320:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse" -c:v gif -f gif "$output" -y &>/dev/null; then
+            echo "$output" >> "$CONVERSION_QUEUE"
+        fi
+    done
+}
+
+if [[ ${#VIDEOS[@]} -gt 0 ]] && [[ $HAS_FFMPEG == true ]]; then
+    convert_videos_background &
+    CONVERTER_PID=$!
+fi
+
+check_new_videos() {
+    if [[ -f "$CONVERSION_QUEUE" ]]; then
+        while IFS= read -r new_gif; do
+            if [[ -f "$new_gif" ]] && [[ ! " ${IMAGES[@]} " =~ " ${new_gif} " ]]; then
+                local random_pos=$((RANDOM % (${#IMAGES[@]} + 1)))
+                IMAGES=("${IMAGES[@]:0:random_pos}" "$new_gif" "${IMAGES[@]:random_pos}")
+                TOTAL=${#IMAGES[@]}
+            fi
+        done < "$CONVERSION_QUEUE"
+        > "$CONVERSION_QUEUE"
+    fi
+}
+
+show_image() {
+    local idx=$1
+
+    if [[ $TOTAL -eq 0 ]]; then
+        return 1
+    fi
+
+    local term_cols=$(tput cols)
+    local img_width
+
+    if [[ $SUPERSCALE == true ]]; then
+        img_width=200
+    elif [[ $UPSCALE == true ]]; then
+        img_width=$((term_cols * 133 / 100))
+    else
+        img_width=$((term_cols * WIDTH_PERCENT / 100))
+    fi
+
+    local file="${IMAGES[$idx]}"
+    local attempts=0
+    local max_attempts=3
+
+    while [[ $attempts -lt $max_attempts ]]; do
+        if [[ -f "$file" ]]; then
+            clear
+            if [[ $VERBOSE == true ]]; then
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo "📸 [$(($idx + 1))/$TOTAL] $(basename "$file")"
+                [[ $PAUSED == true ]] && echo "⏸️  PAUSED" || echo "▶️  PLAYING"
+                if [[ $SUPERSCALE == true ]]; then
+                    echo "🔍 SUPER UPSCALE (200px)"
+                elif [[ $UPSCALE == true ]]; then
+                    echo "🔍 UPSCALE (133%)"
+                else
+                    echo "🔍 WIDTH: ${WIDTH_PERCENT}%"
+                fi
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo ""
+            fi
+
+            catimg -w "$img_width" "$file" 2>/dev/null && break || true
+        fi
+        ((attempts++))
+    done
+
+    if [[ $attempts -eq $max_attempts ]]; then
+        CURRENT_IDX=$(( (CURRENT_IDX + 1) % TOTAL ))
+        return 1
+    fi
+
+    echo ""
+    [[ $VERBOSE == true ]] && echo "Controls: [n]ext | [p]rev | [space]pause | [u]pscale | [s]uper | [j]+5% | [k]-5% | [h]ide | [q]uit"
+    return 0
+}
+
+cleanup() {
+    stty sane
+    clear
+    [[ -n "${CONVERTER_PID:-}" ]] && kill "$CONVERTER_PID" 2>/dev/null || true
+    rm -rf "$TEMP_DIR"
+    exit
+}
+
+stty -echo -icanon time 0 min 0
+trap cleanup EXIT INT TERM
+
+while true; do
+    check_new_videos
+    show_image $CURRENT_IDX || continue
+
+    if [[ $PAUSED == false ]]; then
+        for ((i=0; i<DELAY*10; i++)); do
+            read -t 0.1 -n 1 key || true
+
+            case "$key" in
+                n|N) CURRENT_IDX=$(( (CURRENT_IDX + 1) % TOTAL )); break ;;
+                p|P) CURRENT_IDX=$(( (CURRENT_IDX - 1 + TOTAL) % TOTAL )); break ;;
+                " ") PAUSED=true; break ;;
+                u|U) UPSCALE=$( [[ $UPSCALE == true ]] && echo false || echo true ); SUPERSCALE=false; WIDTH_PERCENT=100; break ;;
+                s|S) SUPERSCALE=$( [[ $SUPERSCALE == true ]] && echo false || echo true ); UPSCALE=false; WIDTH_PERCENT=100; break ;;
+                j|J) UPSCALE=false; SUPERSCALE=false; WIDTH_PERCENT=$((WIDTH_PERCENT + 5)); break ;;
+                k|K) UPSCALE=false; SUPERSCALE=false; WIDTH_PERCENT=$((WIDTH_PERCENT - 5)); [[ $WIDTH_PERCENT -lt 10 ]] && WIDTH_PERCENT=10; break ;;
+                q|Q) cleanup ;;
+                h|H) VERBOSE=$( [[ $VERBOSE == true ]] && echo false || echo true ); show_image $CURRENT_IDX; i=0 ;;
+            esac
+        done
+    else
+        read -n 1 key
+        case "$key" in
+            n|N) CURRENT_IDX=$(( (CURRENT_IDX + 1) % TOTAL )) ;;
+            p|P) CURRENT_IDX=$(( (CURRENT_IDX - 1 + TOTAL) % TOTAL )) ;;
+            " ") PAUSED=false ;;
+            u|U) UPSCALE=$( [[ $UPSCALE == true ]] && echo false || echo true ); SUPERSCALE=false; WIDTH_PERCENT=100 ;;
+            s|S) SUPERSCALE=$( [[ $SUPERSCALE == true ]] && echo false || echo true ); UPSCALE=false; WIDTH_PERCENT=100 ;;
+            j|J) UPSCALE=false; SUPERSCALE=false; WIDTH_PERCENT=$((WIDTH_PERCENT + 5)) ;;
+            k|K) UPSCALE=false; SUPERSCALE=false; WIDTH_PERCENT=$((WIDTH_PERCENT - 5)); [[ $WIDTH_PERCENT -lt 10 ]] && WIDTH_PERCENT=10 ;;
+            q|Q) cleanup ;;
+            h|H) VERBOSE=$( [[ $VERBOSE == true ]] && echo false || echo true ) ;;
+        esac
+    fi
+done
